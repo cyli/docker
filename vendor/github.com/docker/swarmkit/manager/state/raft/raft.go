@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"encoding/base64"
 	"fmt"
 	"math"
 	"math/rand"
@@ -382,6 +383,7 @@ func (n *Node) Run(ctx context.Context) error {
 		if nodeRemoved {
 			// Move WAL and snapshot out of the way, since
 			// they are no longer usable.
+			log.G(ctx).Infof("DEK-DEBUGGING: node has been removed - removing KEKs and raft logs")
 			if err := n.raftLogger.Clear(ctx); err != nil {
 				log.G(ctx).WithError(err).Error("failed to move wal after node removal")
 			}
@@ -466,7 +468,12 @@ func (n *Node) Run(ctx context.Context) error {
 			// Process committed entries
 			for _, entry := range rd.CommittedEntries {
 				if err := n.processCommitted(ctx, entry); err != nil {
+					logrus.Infof("DEK-DEBUGGING: failed to commit entry index %d term %d; currently at applied index %d",
+						entry.Index, entry.Term, n.appliedIndex)
 					log.G(ctx).WithError(err).Error("failed to process committed entries")
+				} else {
+					logrus.Infof("DEK-DEBUGGING: successfully commited entry index %d term %d; currently at applied index %d",
+						entry.Index, entry.Term, n.appliedIndex)
 				}
 			}
 
@@ -477,6 +484,7 @@ func (n *Node) Run(ctx context.Context) error {
 			if n.snapshotInProgress == nil &&
 				(n.needsSnapshot() || raftConfig.SnapshotInterval > 0 &&
 					n.appliedIndex-n.snapshotIndex >= raftConfig.SnapshotInterval) {
+				logrus.Infof("DEK-DEBUGGING: calling doSnapshot after receiving raft entry")
 				n.doSnapshot(ctx, raftConfig)
 			}
 
@@ -514,6 +522,7 @@ func (n *Node) Run(ctx context.Context) error {
 			n.snapshotInProgress = nil
 			n.maybeMarkRotationFinished(ctx)
 			if n.rotationQueued && n.needsSnapshot() {
+				logrus.Infof("DEK-DEBUGGING: doing another snapshot because rotation was queued")
 				// there was a key rotation that took place before while the snapshot
 				// was in progress - we have to take another snapshot and encrypt with the new key
 				n.rotationQueued = false
@@ -530,6 +539,7 @@ func (n *Node) Run(ctx context.Context) error {
 			case n.snapshotInProgress != nil:
 				n.rotationQueued = true
 			case n.needsSnapshot():
+				logrus.Infof("DEK-DEBUGGING: Got rotation notification for key and doing snapshot")
 				n.doSnapshot(ctx, n.getCurrentRaftConfig())
 			}
 		case <-n.removeRaftCh:
@@ -549,7 +559,7 @@ func (n *Node) needsSnapshot() bool {
 		keys := n.keyRotator.GetKeys()
 		if keys.PendingDEK != nil {
 			n.raftLogger.RotateEncryptionKey(keys.PendingDEK)
-			// we want to wait for the last index written with the old DEK to be commited, else a snapshot taken
+			// we want to wait for the last index written with the old DEK to be committed, else a snapshot taken
 			// may have an index less than the index of a WAL written with an old DEK.  We want the next snapshot
 			// written with the new key to supercede any WAL written with an old DEK.
 			n.waitForAppliedIndex = n.writtenIndex
@@ -564,6 +574,8 @@ func (n *Node) needsSnapshot() bool {
 
 func (n *Node) maybeMarkRotationFinished(ctx context.Context) {
 	if n.waitForAppliedIndex > 0 && n.waitForAppliedIndex <= n.snapshotIndex {
+		logrus.Infof("DEK-DEBUGGING: finishing key rotation to %s",
+			base64.RawStdEncoding.EncodeToString(n.raftLogger.EncryptionKey))
 		// this means we tried to rotate - so finish the rotation
 		if err := n.keyRotator.UpdateKeys(EncryptionKeys{CurrentDEK: n.raftLogger.EncryptionKey}); err != nil {
 			log.G(ctx).WithError(err).Error("failed to update encryption keys after a successful rotation")
@@ -892,18 +904,39 @@ func (n *Node) RemoveMember(ctx context.Context, id uint64) error {
 	return n.removeMember(ctx, id)
 }
 
+// processRaftMessageLogger is used to lazily create a logger for
+// ProcessRaftMessage. Usually nothing will be logged, so it is useful to avoid
+// formatting strings and allocating a logger when it won't be used.
+func (n *Node) processRaftMessageLogger(ctx context.Context, msg *api.ProcessRaftMessageRequest) *logrus.Entry {
+	fields := logrus.Fields{
+		"method": "(*Node).ProcessRaftMessage",
+	}
+
+	if n.IsMember() {
+		fields["raft_id"] = fmt.Sprintf("%x", n.Config.ID)
+	}
+
+	if msg != nil && msg.Message != nil {
+		fields["from"] = fmt.Sprintf("%x", msg.Message.From)
+	}
+
+	return log.G(ctx).WithFields(fields)
+}
+
 // ProcessRaftMessage calls 'Step' which advances the
 // raft state machine with the provided message on the
 // receiving node
 func (n *Node) ProcessRaftMessage(ctx context.Context, msg *api.ProcessRaftMessageRequest) (*api.ProcessRaftMessageResponse, error) {
 	if msg == nil || msg.Message == nil {
-		return nil, grpc.Errorf(codes.InvalidArgument, "no message provided")
+		n.processRaftMessageLogger(ctx, msg).Debug("received empty message")
+		return &api.ProcessRaftMessageResponse{}, nil
 	}
 
 	// Don't process the message if this comes from
 	// a node in the remove set
 	if n.cluster.IsIDRemoved(msg.Message.From) {
-		return nil, ErrMemberRemoved
+		n.processRaftMessageLogger(ctx, msg).Debug("received message from removed member")
+		return nil, grpc.Errorf(codes.NotFound, "%s", ErrMemberRemoved.Error())
 	}
 
 	var sourceHost string
@@ -921,16 +954,16 @@ func (n *Node) ProcessRaftMessage(ctx context.Context, msg *api.ProcessRaftMessa
 	if msg.Message.Type == raftpb.MsgVote {
 		member := n.cluster.GetMember(msg.Message.From)
 		if member == nil || member.Conn == nil {
-			log.G(ctx).Errorf("received vote request from unknown member %x", msg.Message.From)
-			return nil, ErrMemberUnknown
+			n.processRaftMessageLogger(ctx, msg).Debug("received message from unknown member")
+			return &api.ProcessRaftMessageResponse{}, nil
 		}
 
 		healthCtx, cancel := context.WithTimeout(ctx, time.Duration(n.Config.ElectionTick)*n.opts.TickInterval)
 		defer cancel()
 
 		if err := member.HealthCheck(healthCtx); err != nil {
-			log.G(ctx).WithError(err).Warningf("member %x which sent vote request failed health check", msg.Message.From)
-			return nil, errors.Wrap(err, "member unreachable")
+			n.processRaftMessageLogger(ctx, msg).Debug("member which sent vote request failed health check")
+			return &api.ProcessRaftMessageResponse{}, nil
 		}
 	}
 
@@ -939,19 +972,18 @@ func (n *Node) ProcessRaftMessage(ctx context.Context, msg *api.ProcessRaftMessa
 		// current architecture depends on only the leader
 		// making proposals, so in-flight proposals can be
 		// guaranteed not to conflict.
-		return nil, grpc.Errorf(codes.InvalidArgument, "proposals not accepted")
+		n.processRaftMessageLogger(ctx, msg).Debug("dropped forwarded proposal")
+		return &api.ProcessRaftMessageResponse{}, nil
 	}
 
 	// can't stop the raft node while an async RPC is in progress
 	n.stopMu.RLock()
 	defer n.stopMu.RUnlock()
 
-	if !n.IsMember() {
-		return nil, ErrNoRaftMember
-	}
-
-	if err := n.raftNode.Step(ctx, *msg.Message); err != nil {
-		return nil, err
+	if n.IsMember() {
+		if err := n.raftNode.Step(ctx, *msg.Message); err != nil {
+			n.processRaftMessageLogger(ctx, msg).WithError(err).Debug("raft Step failed")
+		}
 	}
 
 	return &api.ProcessRaftMessageResponse{}, nil
@@ -1337,7 +1369,7 @@ func (n *Node) sendToMember(ctx context.Context, members map[uint64]*membership.
 
 	_, err := api.NewRaftClient(conn.Conn).ProcessRaftMessage(ctx, &api.ProcessRaftMessageRequest{Message: &m})
 	if err != nil {
-		if grpc.ErrorDesc(err) == ErrMemberRemoved.Error() {
+		if grpc.Code(err) == codes.NotFound && grpc.ErrorDesc(err) == ErrMemberRemoved.Error() {
 			n.removeRaftFunc()
 		}
 		if m.Type == raftpb.MsgSnap {

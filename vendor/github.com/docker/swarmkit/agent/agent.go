@@ -309,6 +309,7 @@ func (a *Agent) handleSessionMessage(ctx context.Context, message *api.SessionMe
 	}
 
 	// prune managers not in list.
+	log.G(ctx).Infof("AGENT-DEBUGGING: handle session message - seen=%v, manager-weights=%v", seen, a.config.Managers.Weights())
 	for peer := range a.config.Managers.Weights() {
 		if _, ok := seen[peer]; !ok {
 			a.config.Managers.Remove(peer)
@@ -454,7 +455,7 @@ func (a *Agent) nodeDescriptionWithHostname(ctx context.Context) (*api.NodeDescr
 	return desc, err
 }
 
-// nodesEqual returns true if the node states are functionaly equal, ignoring status,
+// nodesEqual returns true if the node states are functionally equal, ignoring status,
 // version and other superfluous fields.
 //
 // This used to decide whether or not to propagate a node update to executor.

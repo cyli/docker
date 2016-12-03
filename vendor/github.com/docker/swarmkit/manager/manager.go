@@ -388,26 +388,43 @@ func (m *Manager) Run(parent context.Context) error {
 
 	close(m.started)
 
+	errCh := make(chan error, 1)
 	go func() {
 		err := m.raftNode.Run(ctx)
+		log.G(ctx).Infof("MANAGER-DEBUGGING: raft node stopped because: %v", err)
 		if err != nil {
+			errCh <- err
 			log.G(ctx).WithError(err).Error("raft node stopped")
 			m.Stop(ctx)
 		}
 	}()
 
-	if err := raft.WaitForLeader(ctx, m.raftNode); err != nil {
+	returnErr := func(err error) error {
+		select {
+		case runErr := <-errCh:
+			if runErr == raft.ErrMemberRemoved {
+				return runErr
+			}
+		default:
+		}
 		return err
+	}
+
+	if err := raft.WaitForLeader(ctx, m.raftNode); err != nil {
+		log.G(ctx).Infof("MANAGER-DEBUGGING: wait for leader errored: %v", err)
+		return returnErr(err)
 	}
 
 	c, err := raft.WaitForCluster(ctx, m.raftNode)
 	if err != nil {
-		return err
+		log.G(ctx).Infof("MANAGER-DEBUGGING: wait for cluster errored: %v", err)
+		return returnErr(err)
 	}
 	raftConfig := c.Spec.Raft
 
 	if err := m.watchForKEKChanges(ctx); err != nil {
-		return err
+		log.G(ctx).Infof("MANAGER-DEBUGGING: watch for kek changes errored: %v", err)
+		return returnErr(err)
 	}
 
 	if int(raftConfig.ElectionTick) != m.raftNode.Config.ElectionTick {
@@ -419,6 +436,7 @@ func (m *Manager) Run(parent context.Context) error {
 
 	// wait for an error in serving.
 	err = <-errServe
+	log.G(ctx).Infof("MANAGER-DEBUGGING: error serving (manager stopping) because: %v", err)
 	m.mu.Lock()
 	if m.stopped {
 		m.mu.Unlock()
@@ -426,7 +444,8 @@ func (m *Manager) Run(parent context.Context) error {
 	}
 	m.mu.Unlock()
 	m.Stop(ctx)
-	return err
+
+	return returnErr(err)
 }
 
 const stopTimeout = 8 * time.Second
