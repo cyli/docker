@@ -99,6 +99,63 @@ func TestLoadDaemonCliWithDuplicateLabels(t *testing.T) {
 	assert.Check(t, err)
 }
 
+func TestLoadDaemonCliWithReservedNamespaceLabels(t *testing.T) {
+	for _, tc := range []struct {
+		specifiedLabels []string
+		expectedLabels  map[string]struct{}
+	}{
+		{ // all labels are propagated if there aren't any reserved namespace labels
+			specifiedLabels: []string{
+				"hello=world",
+				"label=me",
+			},
+			expectedLabels: map[string]struct{}{
+				"hello=world": {},
+				"label=me":    {},
+			},
+		},
+		{ // if there are no labels, no additional labels are added
+			specifiedLabels: nil,
+			expectedLabels:  nil,
+		},
+		{ // all reserved namespace labels are removed
+			specifiedLabels: []string{
+				"com.docker.feature=enabled",
+				"io.docker.configuration=0",
+				"org.dockerproject.setting=on",
+			},
+			expectedLabels: nil,
+		},
+		{ // only reserved namespaces that end with a dot are removed
+			specifiedLabels: []string{
+				"com.dockerpsychnotreserved.label=value",
+				"COM.docker.feature=enabled",
+				"io.DOCKER.CONFIGURATION=0",
+				"io.dockerproject.not=reserved",
+				"Org.Dockerproject.Setting=on",
+				"org.docker.not=reserved",
+			},
+			expectedLabels: map[string]struct{}{
+				"com.dockerpsychnotreserved.label=value": {},
+				"io.dockerproject.not=reserved":          {},
+				"org.docker.not=reserved":                {},
+			},
+		},
+	} {
+		opts := defaultOptions("")
+		for _, l := range tc.specifiedLabels {
+			assert.Check(t, opts.flags.Set("label", l))
+		}
+		conf, err := loadDaemonCliConfig(opts)
+		assert.Check(t, err)
+		assert.Check(t, is.Len(conf.Labels, len(tc.expectedLabels)))
+		// due to stripping out the duplicate, the order of the labels are no longer guaranteed
+		for _, label := range conf.Labels {
+			assert.Check(t, is.Contains(tc.expectedLabels, label))
+		}
+	}
+}
+
 func TestLoadDaemonCliConfigWithTLSVerify(t *testing.T) {
 	tempFile := fs.NewFile(t, "config", fs.WithContent(`{"tlsverify": true}`))
 	defer tempFile.Remove()

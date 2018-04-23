@@ -293,6 +293,8 @@ func (cli *DaemonCli) reloadConfig() {
 		}
 		cli.authzMiddleware.SetPlugins(config.AuthorizationPlugins)
 
+		config.Labels = filterReservedNamespaceLabels(config.Labels)
+
 		if err := cli.d.Reload(config); err != nil {
 			logrus.Errorf("Error reconfiguring the daemon: %v", err)
 			return
@@ -306,7 +308,6 @@ func (cli *DaemonCli) reloadConfig() {
 			case config.Debug && !debugEnabled: // enable debug
 				debug.Enable()
 			}
-
 		}
 	}
 
@@ -340,6 +341,26 @@ func shutdownDaemon(d *daemon.Daemon) {
 	case <-time.After(time.Duration(shutdownTimeout) * time.Second):
 		logrus.Error("Force shutdown daemon")
 	}
+}
+
+// Previously we just documented that the com.docker.*, io.docker.*, org.dockerproject.*
+// namespaces were reserved and should not be used, but we did not enforce this.  Now
+// we will filter them out, but we should error instead at the next stable release.
+// The logic for erroring can probably be added to config.Validate.
+func filterReservedNamespaceLabels(labels []string) []string {
+	var filtered []string
+	for _, label := range labels {
+		lowered := strings.ToLower(label)
+		if strings.HasPrefix(lowered, "com.docker.") || strings.HasPrefix(lowered, "io.docker.") ||
+			strings.HasPrefix(lowered, "org.dockerproject.") {
+			continue
+		}
+		filtered = append(filtered, label)
+	}
+	if len(filtered) < len(labels) {
+		logrus.Warn("The com.docker.*, io.docker.*, and org.dockerprojects.* namespaces are reserved.  Labels using these namespaces will be ignored.")
+	}
+	return filtered
 }
 
 func loadDaemonCliConfig(opts *daemonOptions) (*config.Config, error) {
@@ -406,7 +427,7 @@ func loadDaemonCliConfig(opts *daemonOptions) (*config.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	conf.Labels = newLabels
+	conf.Labels = filterReservedNamespaceLabels(newLabels)
 
 	// Regardless of whether the user sets it to true or false, if they
 	// specify TLSVerify at all then we need to turn on TLS
